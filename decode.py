@@ -46,6 +46,18 @@ def normalize_position(p):
 class ParseError(Exception):
     pass
 
+def parse_args(parser: argparse.ArgumentParser) -> argparse.Namespace:
+    global opt
+    parser.add_argument("-s", "--skip-bad", action="store_true", dest="skip",
+    help="skip unparsable blueprints and exit with '2'"),
+    parser.add_argument("-d", "--debug", action="store_true", dest="d",
+        help="debug output on STDERR")
+    parser.add_argument("-x", "--extended", action="store_true", dest="x",
+        help="extended output: add voluminous stuff found in .dat but not used in .export"
+        " Currently:\n - migrations\n - prototype index")
+    parser.add_argument("--file", dest="filename", nargs="?")
+    opt = parser.parse_known_args()[0]
+    return opt
 
 ################################################################
 #
@@ -2897,19 +2909,8 @@ if __name__ == "__main__":
     sys.stdout = io.TextIOWrapper(sys.stdout.detach(), encoding="utf-8")
     sys.stderr = io.TextIOWrapper(sys.stderr.detach(), encoding="utf-8")
 
-    parser = argparse.ArgumentParser(
-        description="Convert a binary 'blueprint-storage.dat' file JSON.")
-    parser.add_argument("-s", "--skip-bad", action="store_true", dest="skip",
-        help="skip unparsable blueprints and exit with '2'"),
-    parser.add_argument("-v", "--verbose", action="store_true", dest="v",
-        help="verbose output on STDERR")
-    parser.add_argument("-d", "--debug", action="store_true", dest="d",
-        help="debug output on STDERR")
-    parser.add_argument("-x", "--extended", action="store_true", dest="x",
-        help="extended output: add voluminous stuff found in .dat but not used in .export"
-        " Currently:\n - migrations\n - prototype index")
-    parser.add_argument("filename", nargs="?", default="blueprint-storage.dat")
-    opt = parser.parse_args()
+    parser = argparse.ArgumentParser(description="Convert a binary 'blueprint-storage.dat' file JSON.")
+    opt = parse_args(parser)
 
     verbose(f"file: {opt.filename}")
     with open(opt.filename, "rb") as f:
