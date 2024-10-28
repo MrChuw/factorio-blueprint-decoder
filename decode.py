@@ -8,9 +8,41 @@ import time
 import traceback
 from enum import Enum
 import io
+from io import BytesIO
+
 
 
 version = None  # global state is not nice but that's how it is for now.
+
+
+class SeenHexs:
+    def __init__(self):
+        self.hexs: list[str] = [] 
+        self.hexs_complete: list[str] = [""]
+        self.collum_size = 16
+        self.count = 0
+        self.row = 0
+        self.last_row = ""
+        self.last_row_no_spaces = ""
+
+    def add(self, hex):
+        self.hexs.append(hex)
+        for temp_hex in hex.split(" "):
+            if self.count >= self.collum_size - 1:
+                self.hexs_complete[self.row] += f"{temp_hex} "
+                self.last_row = self.hexs_complete[self.row]
+                self.last_row_no_spaces = self.last_row.replace(" ", "")
+                self.row += 1
+                self.count = 0
+                # print(f"{self.last_row} || {self.last_row_no_spaces}")
+                self.hexs_complete.append("")
+                self.hexs.clear()
+            else:
+                self.count += 1
+                self.hexs_complete[self.row] += f"{temp_hex} "
+
+seen_hex = set()
+seen_hex_complete: list[str] = []
 
 skipped_blueprints = 0
 
@@ -93,6 +125,7 @@ V_1_1_75_1 = Version(1,1,75,1)
 V_1_1_77_2 = Version(1,1,77,2)
 V_1_1_82_4 = Version(1,1,82,4)
 V_1_1_83_4 = Version(1,1,83,4)
+V_2_0_9_1  = Version(2,0,9,1)
 
 STABLE_V_1_1 = V_1_1_19_0   # marker for "somewhere between 1.0 and first stable 1.1"
 
@@ -114,6 +147,8 @@ class Index:
         TILE = "tile"
         ENTITY = "entity"
         RECIPE = "recipe"
+        QUALITY = "quality"
+        PLANET = "planet"
 
     ITEM = Type.ITEM
     FLUID = Type.FLUID
@@ -121,6 +156,8 @@ class Index:
     TILE = Type.TILE
     ENTITY = Type.ENTITY
     RECIPE = Type.RECIPE
+    QUALITY = Type.QUALITY
+    PLANET = Type.PLANET
 
     _type_mapping = {
         # item
@@ -165,7 +202,10 @@ class Index:
         "constant-combinator": ENTITY,
         "container": ENTITY,
         "curved-rail": ENTITY,
+        "curved-rail-a": ENTITY,
+        "curved-rail-b": ENTITY,
         "decider-combinator": ENTITY,
+        "selector-combinator": ENTITY,
         "electric-energy-interface": ENTITY,
         "electric-pole": ENTITY,
         "electric-turret": ENTITY,
@@ -222,6 +262,8 @@ class Index:
         "recipe": RECIPE,
         # special
         "flying-text": ENTITY,  # no handler (yet), used for "unknown-entity" in upgrade- and deconstruction plans
+        "quality": QUALITY,
+        "planet": PLANET,
     }
 
     class Entry:
@@ -239,6 +281,8 @@ class Index:
             self.TILE: {},
             self.ENTITY: {},
             self.RECIPE: {},
+            self.QUALITY: {},
+            self.PLANET: {},
         }
 
     def add(self, id: int, prototype: str, name: str) -> Entry:
@@ -264,12 +308,23 @@ class Index:
 class PrimitiveStream:
 
     def __init__(self, f):
-        self._f = f
+        self._f: BytesIO = f
+        self.SeenHexs = SeenHexs()
 
     def _read(self, format):
-        return struct.unpack(
-            format,
-            self._f.read(struct.calcsize(format)))[0]
+        global seen_hex, seen_hex_complete
+        calcisize = struct.calcsize(format)
+        readed = self._f.read(calcisize)
+        formated = struct.unpack(format, readed)
+        to_hex = self._to_hex(readed)
+        self.SeenHexs.add(to_hex)
+        return formated[0]
+
+    def _string_read(self, length):
+        readed = self._f.read(length)
+        to_hex = self._to_hex(readed)
+        self.SeenHexs.add(to_hex)
+        return readed.decode("utf-8")
 
     def tell(self):
         return self._f.tell()
@@ -334,7 +389,8 @@ class PrimitiveStream:
 
     def string(self):
         length = self.count()
-        return self._f.read(length).decode("utf-8")
+        return self._string_read(length)
+        # return self._f.read(length).decode("utf-8")
 
     def mapped_u8(self, *args):
         index = self.u8()
@@ -368,6 +424,7 @@ class PrimitiveStream:
         file_position = self.tell()
         data = self._f.read(size)
         data = self._to_hex(data)
+        self.SeenHexs.add(data)
 
         if guess:
             debug(f"#\tignored {guess} @{file_position:#x}: {data}")
@@ -401,7 +458,7 @@ class PrimitiveStream:
 #
 # stream helpers
 
-def read_entry(stream, index: Index, type: Index.Type) -> Index.Entry:
+def read_entry(stream: PrimitiveStream, index: Index, type: Index.Type) -> Index.Entry:
     if type == Index.TILE:
         id = stream.u8()
         offset = 1
@@ -419,7 +476,7 @@ def read_entry(stream, index: Index, type: Index.Type) -> Index.Entry:
         return None
 
 
-def read_name(stream, index: Index, type: Index.Type) -> str:
+def read_name(stream: PrimitiveStream, index: Index, type: Index.Type) -> str:
     entry = read_entry(stream, index, type)
     if entry:
         return entry.name
@@ -427,7 +484,7 @@ def read_name(stream, index: Index, type: Index.Type) -> str:
         return None
 
 
-def read_signal(stream, index: Index):
+def read_signal(stream: PrimitiveStream, index: Index):
     index_type = stream.mapped_u8(Index.ITEM, Index.FLUID, Index.VSIGNAL)
     name = read_name(stream, index, index_type)
     if not name:
@@ -443,7 +500,7 @@ def read_signal(stream, index: Index):
 #   length: 12 byte
 #   default: 01 00 00 00 00 00 00 00 00 00 00 01
 #
-def read_condition(stream, index: Index):
+def read_condition(stream: PrimitiveStream, index: Index):
     # same order in drop-down
     comparator = stream.mapped_u8(">", "<", "=", "≥", "≤", "≠")
 
@@ -493,7 +550,7 @@ def read_condition(stream, index: Index):
 #   - Type 4 (`List`) cannot be set via Lua: Both arrays and dictionaries are
 #       the same construct.
 #
-def read_tag_property_tree(stream):
+def read_tag_property_tree(stream: PrimitiveStream):
     type = stream.u8()
     any_type = stream.bool() # ignored
     if type == 0:       # None
@@ -513,7 +570,7 @@ def read_tag_property_tree(stream):
         raise ParseError(f"invalid type {type} in property tree at position {position} ({position:#x})")
 
 
-def read_tag_list(stream):
+def read_tag_list(stream: PrimitiveStream):
     result = []
     count = stream.count32()
     for i in range(count):
@@ -523,7 +580,7 @@ def read_tag_list(stream):
     return result
 
 
-def read_tag_dictionary(stream):
+def read_tag_dictionary(stream: PrimitiveStream):
     result = {}
     count = stream.count32()
     for i in range(count):
@@ -532,7 +589,7 @@ def read_tag_dictionary(stream):
         result[entry_name] = entry_value
     return result
 
-def read_tag_string(stream):
+def read_tag_string(stream: PrimitiveStream):
     is_empty = stream.bool()
     if is_empty:
         return None
@@ -545,14 +602,14 @@ def read_tag_string(stream):
 # entity parts (ep_*)
 
 
-def ep_entity_id(stream, index, entity):
+def ep_entity_id(stream: PrimitiveStream, index, entity):
     flags = stream.u8()
     # 0x10	-- has entity id (default=0)
     if flags | 0x10 != 0x10:
         file_position = stream.tell() - 1
         raise ParseError(f"unexpected flags {flags:#04x} at {file_position} ({file_position:#x})")
 
-    if flags & 0x10:
+    if flags & 0x10: # TODO: Testar wires
         stream.expect(0x01)
         entity_id = stream.u32()
         entity["entity_id"] = entity_id
@@ -567,7 +624,7 @@ def ep_entity_id(stream, index, entity):
         # (and their *number*) known.
 
 
-def ep_v1_1_51_4_flag(stream, index, entity, *expected_values):
+def ep_v1_1_51_4_flag(stream: PrimitiveStream, index, entity, *expected_values):
     if version >= V_1_1_51_4:
         # * In the vanilla game turrets, land-mines and radar have the
         #   value 0x01.
@@ -580,7 +637,7 @@ def ep_v1_1_51_4_flag(stream, index, entity, *expected_values):
             stream.expect_oneof(*expected_values)
 
 
-def ep_v1_1_62_5_flag(stream, index, entity):
+def ep_v1_1_62_5_flag(stream: PrimitiveStream, index, entity):
     # Release-Notes 1.1.62:
     #   > Added support for container entities with filters
     #   > by using inventory_type = "with_bar" or "with_filters_and_bar".
@@ -589,7 +646,7 @@ def ep_v1_1_62_5_flag(stream, index, entity):
         stream.expect(0x00)
 
 
-def ep_bar(stream, index, entity):
+def ep_bar(stream: PrimitiveStream, index, entity):
     # TODO: cargo-wagon wants to call this not with a real entity
     # but with an "inventory" wrapper. Handle this case better.
 
@@ -630,13 +687,13 @@ def ep_bar(stream, index, entity):
 
 # maybe helpfull: https://wiki.factorio.com/Types/Direction
 # Turrets seem to support an additional value `8`.
-def ep_direction(stream, index, entity):
+def ep_direction(stream: PrimitiveStream, index, entity):
     direction = stream.u8()
     if direction:
         entity["direction"] = direction
 
 
-def ep_orientation(stream, index, entity):
+def ep_orientation(stream: PrimitiveStream, index, entity):
     # 00 00 00 00 = 0.0f  -> North
     # 00 00 80 3e = 0.25f -> East
     # 00 00 00 3f = 0.5f  -> South
@@ -646,7 +703,7 @@ def ep_orientation(stream, index, entity):
     entity["orientation"] = orientation
 
 
-def ep_logistic_settings(stream, index, entity):
+def ep_logistic_settings(stream: PrimitiveStream, index, entity):
     # 1: active provider
     # 2: storage
     # 3: requester
@@ -688,7 +745,7 @@ def ep_logistic_settings(stream, index, entity):
             entity["request_from_buffers"] = True
 
 
-def ep_circuit_connections(stream, index, entity, own_circuit_id="1"):
+def ep_circuit_connections(stream: PrimitiveStream, index, entity, own_circuit_id="1"):
     connections = {}
 
     # How many "colors"?
@@ -717,7 +774,7 @@ def ep_circuit_connections(stream, index, entity, own_circuit_id="1"):
     stream.expect(*[0x00]*9)
 
 
-def ep_circuit_condition(stream, index, entity):
+def ep_circuit_condition(stream: PrimitiveStream, index, entity):
     circuit_condition = read_condition(stream, index)
     if circuit_condition:
         control_behavior = entity.setdefault("control_behavior", {})
@@ -774,7 +831,7 @@ def ep_filters(stream, index, entity):
         entity["filters"] = filters
 
 
-def ep_items(stream, index, entity):
+def ep_items(stream: PrimitiveStream, index, entity):
 
     # Interesting point: Items are not a simple list like icons.
     # Instead the items are first sorted and then grouped by type.
@@ -791,7 +848,7 @@ def ep_items(stream, index, entity):
         entity["items"] = items
 
 
-def ep_color(stream, index, entity):
+def ep_color(stream: PrimitiveStream, index, entity):
     use_color = stream.bool()
     if use_color:
         entity["color"] = {
@@ -802,7 +859,7 @@ def ep_color(stream, index, entity):
         }
 
 
-def ep_turret_common(stream, index, entity):
+def ep_turret_common(stream: PrimitiveStream, index, entity):
     ep_v1_1_51_4_flag(stream, index, entity, 0x01) # Strange: Why is that value "1" HERE!
     if version >= V_1_1_82_4:
         stream.expect(0x4d)
@@ -840,7 +897,7 @@ def fixup_turret_direction(stream, index, entity):
 #
 # https://github.com/raiguard/Factorio-SmallMods/blob/master/QuickbarTemplates/control.lua#L81
 #
-def ep_tags(stream, index, entity):
+def ep_tags(stream: PrimitiveStream, index, entity):
     has_tags = stream.bool();
     if has_tags:
         tags = {}
@@ -859,7 +916,7 @@ def ep_tags(stream, index, entity):
 #
 # entity handlers (eh_*)
 
-def eh_container(stream, index, entity):
+def eh_container(stream: PrimitiveStream, index, entity):
     ep_v1_1_51_4_flag(stream, index, entity, 0x00)
     ep_v1_1_62_5_flag(stream, index, entity)
 
@@ -872,7 +929,7 @@ def eh_container(stream, index, entity):
         ep_circuit_connections(stream, index, entity)
 
 
-def eh_logistic_container(stream, index, entity):
+def eh_logistic_container(stream: PrimitiveStream, index, entity):
     ep_v1_1_51_4_flag(stream, index, entity, 0x00)
     ep_v1_1_62_5_flag(stream, index, entity)
 
@@ -897,7 +954,7 @@ def eh_logistic_container(stream, index, entity):
             control_behavior["circuit_mode_of_operation"] = mode_of_operation
 
 
-def eh_infinity_container(stream, index, entity):
+def eh_infinity_container(stream: PrimitiveStream, index, entity):
     ep_v1_1_51_4_flag(stream, index, entity, 0x00)
     ep_v1_1_62_5_flag(stream, index, entity)
 
@@ -943,7 +1000,7 @@ def eh_infinity_container(stream, index, entity):
     entity["infinity_settings"]["remove_unfiltered_items"] = remove_unfiltered_items
 
 
-def eh_storage_tank(stream, index, entity):
+def eh_storage_tank(stream: PrimitiveStream, index, entity):
     ep_v1_1_51_4_flag(stream, index, entity, 0x00)
     ep_direction(stream, index, entity)
 
@@ -954,8 +1011,11 @@ def eh_storage_tank(stream, index, entity):
         ep_circuit_connections(stream, index, entity)
 
 
-def eh_transport_belt(stream, index, entity):
-    ep_v1_1_51_4_flag(stream, index, entity, 0x00)
+def eh_transport_belt(stream: PrimitiveStream, index, entity):
+    skip = 0x01
+    stream.expect(skip)
+    debug(f"I don't know what it is but I skipped: {skip:#04x}")
+    ep_v1_1_51_4_flag(stream, index, entity, 0x00)  # TODO: I think is not needed anymore but need check
     ep_direction(stream, index, entity)
 
     # circuit network connections
@@ -989,14 +1049,14 @@ def eh_transport_belt(stream, index, entity):
         stream.expect(0xff, 0xff, 0xff, 0xff)
 
 
-def eh_underground_belt(stream, index, entity):
+def eh_underground_belt(stream: PrimitiveStream, index, entity):
     ep_v1_1_51_4_flag(stream, index, entity, 0x00)
     ep_direction(stream, index, entity)
     type = stream.mapped_u8("input", "output")
     entity["type"] = type
 
 
-def eh_splitter(stream, index, entity):
+def eh_splitter(stream: PrimitiveStream, index, entity):
     ep_v1_1_51_4_flag(stream, index, entity, 0x00)
     ep_direction(stream, index, entity)
 
@@ -1036,7 +1096,7 @@ def eh_splitter(stream, index, entity):
         entity["filter"] = filter_name
 
 
-def eh_inserter(stream, index, entity):
+def eh_inserter(stream: PrimitiveStream, index, entity):
     ep_v1_1_51_4_flag(stream, index, entity, 0x00)
 
     # 0x01 -- override_stack_size
@@ -1117,7 +1177,7 @@ def eh_inserter(stream, index, entity):
         normalize_position(entity["pickup_position"])
 
 
-def eh_electric_pole(stream, index, entity):
+def eh_electric_pole(stream: PrimitiveStream, index, entity):
     ep_v1_1_51_4_flag(stream, index, entity, 0x00)
 
     # v1.1.0:
@@ -1157,16 +1217,16 @@ def eh_electric_pole(stream, index, entity):
         circuit_id = stream.u8()
 
 
-def eh_pipe(stream, index, entity):
+def eh_pipe(stream: PrimitiveStream, index, entity):
     ep_v1_1_51_4_flag(stream, index, entity, 0x00)
 
 
-def eh_pipe_to_ground(stream, index, entity):
+def eh_pipe_to_ground(stream: PrimitiveStream, index, entity):
     ep_v1_1_51_4_flag(stream, index, entity, 0x00)
     ep_direction(stream, index, entity)
 
 
-def eh_pump(stream, index, entity):
+def eh_pump(stream: PrimitiveStream, index, entity):
     ep_v1_1_51_4_flag(stream, index, entity, 0x00)
     ep_direction(stream, index, entity)
 
@@ -1327,7 +1387,7 @@ def eh_rail_chain_signal(stream, index, entity):
             del entity["control_behavior"]
 
 
-def eh_locomotive(stream, index, entity):
+def eh_locomotive(stream: PrimitiveStream, index, entity):
     ep_v1_1_51_4_flag(stream, index, entity, 0x00, 0x01)
     stream.expect(0x00)
 
@@ -1937,7 +1997,7 @@ def eh_rocket_silo(stream, index, entity):
         entity["auto_launch"] = True
 
 
-def eh_loader(stream, index, entity):
+def eh_loader(stream: PrimitiveStream, index, entity):
     ep_v1_1_51_4_flag(stream, index, entity, 0x00)
     ep_direction(stream, index, entity)
 
@@ -1961,7 +2021,7 @@ def eh_loader_1x1(stream, index, entity):
     eh_loader(stream, index, entity)
 
 
-def eh_electric_energy_interface(stream, index, entity):
+def eh_electric_energy_interface(stream: PrimitiveStream, index, entity):
     ep_v1_1_51_4_flag(stream, index, entity, 0x00)
 
     power_production = stream.f64()
@@ -2130,7 +2190,7 @@ def parse_version(stream, result):
         result["_version_"] = version
 
 
-def parse_migrations(stream, result):
+def parse_migrations(stream: PrimitiveStream, result):
     migrations = []
     migration_count = stream.count8()
     if opt.x:
@@ -2148,7 +2208,7 @@ def parse_migrations(stream, result):
         result["migrations"] = migrations
 
 
-def parse_index(stream, result):
+def parse_index(stream: PrimitiveStream, result):
     index = Index()
     index_dict = {}
 
@@ -2157,18 +2217,26 @@ def parse_index(stream, result):
     for p in range(prototype_count):
         prototype_name = stream.string()
         names = index_dict[prototype_name] = {}
-        if prototype_name == "tile":    # strange exception
-            name_count = stream.count8()
+        if prototype_name == "quality":    # strange exception
+            pass
+            # name_count = stream.count8()
+            name_count = 1
             debug(f"    [{p}] prototype '{prototype_name}' - entries: {name_count}")
+            # stream.expect(0x01)
+            # stream.expect(0x01)
+            ...
             for n in range(name_count):
-                name_id = stream.u8()
+                name_id = stream.u16()
                 name = stream.string()
                 debug(f"        [{n}] {name_id:02x} '{name}'")
+                if name == "\x00":
+                    break
                 names[name_id] = name
                 index.add(name_id, prototype_name, name)
         else:
             name_count = stream.count16()
             debug(f"    [{p}] prototype '{prototype_name}' - entries: {name_count}")
+            ...
             for n in range(name_count):
                 name_id = stream.u16()
                 name = stream.string()
@@ -2191,7 +2259,7 @@ object_prototypes = (
     dict(key="upgrade_planner", prototype="upgrade-item"),
 )
 
-def parse_library_objects(stream, index, result, library_version):
+def parse_library_objects(stream: PrimitiveStream, index, result, library_version):
 
     object_count = stream.count32()
     verbose(f"\nlibrary objects: {object_count}")
@@ -2236,7 +2304,7 @@ def parse_library_objects(stream, index, result, library_version):
     result["blueprints"] = objects
 
 
-def parse_icons(stream, index, result):
+def parse_icons(stream: PrimitiveStream, index, result):
     unknown_icons = []
     unknown_icons_count = stream.u8()
     for u in range(unknown_icons_count):
@@ -2250,6 +2318,7 @@ def parse_icons(stream, index, result):
     debug(f"icons: {icon_count}")
     for i in range(icon_count):
         icon = read_signal(stream, index)
+        stream.ignore(1, "dont know but is new")
         if icon:
             if unknown_icons[i:i+1]:
                 icon["name"] = unknown_icons[i]
@@ -2264,7 +2333,7 @@ def parse_icons(stream, index, result):
         result["icons"] = icons
 
 
-def parse_snap_to_grid(stream, result):
+def parse_snap_to_grid(stream: PrimitiveStream, result):
     snap_to_grid = stream.bool()
     if snap_to_grid:
         result["snap-to-grid"] = {
@@ -2284,7 +2353,7 @@ def parse_snap_to_grid(stream, result):
                     result["position-relative-to-grid"] = relative
 
 
-def parse_entities(stream, index, result):
+def parse_entities(stream: PrimitiveStream, index, result):
     entities = result["entities"] = []
 
     entity_count = stream.count32()
@@ -2357,7 +2426,7 @@ def parse_entities(stream, index, result):
         del result["entities"]
 
 
-def parse_schedules(stream, index, result):
+def parse_schedules(stream: PrimitiveStream, index, result):
     schedules_count = stream.count8()
     schedules = []
     if schedules_count:
@@ -2470,7 +2539,7 @@ def parse_schedules(stream, index, result):
         result["schedules"] = schedules
 
 
-def parse_tiles(stream, index, result):
+def parse_tiles(stream: PrimitiveStream, index, result):
     tiles = []
     tile_count = stream.count32()
     debug(f"tiles: {tile_count}")
@@ -2594,6 +2663,8 @@ def parse_blueprint_library(stream: PrimitiveStream):
     if opt.x:
         result["_save_timestamp_"] = timestring
 
+    stream.ignore(4, "Dont know what this is but after this is back to the old way (maybe?)")
+
     stream.expect(0x01)
 
     parse_library_objects(stream, global_index, book_item, library_version)
@@ -2676,6 +2747,8 @@ def parse_blueprint(stream: PrimitiveStream, index, library_version):
 
         parse_migrations(stream, result)
 
+        stream.ignore(20, "They added something to the blueprint, I don't know what it is. I only kwon that is equal in every blueprint.")
+
         description = stream.string()
         if description:
             result["description"] = description
@@ -2691,6 +2764,8 @@ def parse_blueprint(stream: PrimitiveStream, index, library_version):
         parse_icons(stream, index, result)
 
         fixup_entity_ids(result)
+
+        # it has 2 new bytes at the end
 
     except Exception as e:
         if not opt.skip:
